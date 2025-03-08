@@ -57,6 +57,9 @@ module emu
 	input  [11:0] HDMI_HEIGHT,
 	output        HDMI_FREEZE,
 	output        HDMI_BLACKOUT,
+	output        gun_border_en,
+	
+	
 
 `ifdef MISTER_FB
 	// Use framebuffer in DDRAM
@@ -170,15 +173,14 @@ module emu
 	// Set USER_OUT to 1 to read from USER_IN.
 	input   [6:0] USER_IN,
 	output  [6:0] USER_OUT,
-
 	input         OSD_STATUS
 );
 
 assign ADC_BUS  = 'Z;
 
 assign AUDIO_S   = 1;
+assign gun_border_en = status[47];
 assign AUDIO_MIX = status[20:19];
-
 assign LED_USER  = cart_download | spc_download | (status[23] & bk_pending);
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
@@ -319,6 +321,7 @@ parameter CONF_STR = {
 	"d5P1o36,Crop Offset,0,2,4,8,10,12,-12,-10,-8,-6,-4,-2;",
 	"P1o89,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 	"P1oA,Force 256px,Off,On;",
+	"P1oF,Sinden Boarder,Off,On;",
 	"P1-;",
 	"P1OG,Pseudo Transparency,Blend,Off;",
 	"P1-;",
@@ -403,6 +406,8 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.joystick_4(joy4),
 	.ps2_mouse(ps2_mouse),
 	.ps2_key(ps2_key),
+	
+
 
 	.status(status),
 	.status_menumask(status_menumask),
@@ -637,6 +642,7 @@ main main
 	.JOY1_P6(JOY1_P6),
 	.JOY2_P6(JOY2_P6),
 	.JOY2_P6_in(JOY2_P6_DI),
+	
 	
 	.EXT_RTC(RTC),
 
@@ -984,6 +990,7 @@ miraclepiano miracle(
 	.data_o(uart_data),
 	.txd(UART_TXD),
 	.rxd(UART_RXD)
+	
 );
 wire [1:0] JOY1_DO = piano ? {1'b1,piano_joypad_do} : JOY1_DO_t;
 
@@ -1045,6 +1052,7 @@ lightgun lightgun
 
 	.JOY_X(GUN_MODE[0] ? joy0_x : joy1_x),
 	.JOY_Y(GUN_MODE[0] ? joy0_y : joy1_y),
+	
 
 	.F(GUN_BTN ? ps2_mouse[0] : ((GUN_MODE[0]&(joy0[4]|joy0[9]) | (GUN_MODE[1]&(joy1[4]|joy1[9]))))),
 	.C(GUN_BTN ? ps2_mouse[1] : ((GUN_MODE[0]&(joy0[5]|joy0[8]) | (GUN_MODE[1]&(joy1[5]|joy0[8]))))),
