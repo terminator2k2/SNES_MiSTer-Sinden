@@ -58,6 +58,7 @@ module emu
 	output        HDMI_FREEZE,
 	output        HDMI_BLACKOUT,
 	output        HDMI_BOB_DEINT,
+	output        GUN_BORDER_EN,
 
 `ifdef MISTER_FB
 	// Use framebuffer in DDRAM
@@ -176,7 +177,7 @@ module emu
 );
 
 assign ADC_BUS  = 'Z;
-
+assign GUN_BORDER_EN = status[54];
 assign AUDIO_S   = 1;
 assign AUDIO_MIX = status[20:19];
 
@@ -293,7 +294,7 @@ wire reset = RESET | buttons[1] | status[0] | cart_download | spc_download | bk_
 // 0         1         2         3          4         5         6
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX X XXXXXXXXXXXXXXXXX XXXX
+// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX X XXXXXXXXXXXXXXXXX XXXXX
 
 `include "build_id.v"
 parameter CONF_STR = {
@@ -326,6 +327,7 @@ parameter CONF_STR = {
 	"d5P1o36,Crop Offset,0,2,4,8,10,12,-12,-10,-8,-6,-4,-2;",
 	"P1o89,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 	"P1oA,Force 256px,Off,On;",
+	"P1oM,Sinden Boarder,Off,On;",
 	"P1-;",
 	"P1OG,Pseudo Transparency,Blend,Off;",
 	"P1-;",
@@ -478,7 +480,6 @@ wire msu_audio_download = ioctl_download & ioctl_index[5:0] == 6'h02;
 wire msu_data_download  = ioctl_download & ioctl_index[5:0] == 6'h03;
 wire ssbin_download = ioctl_download & ((ioctl_index[5:0] == 6'h00) & (ioctl_index[7:6] == 2'd1));
 
-
 reg new_vmode;
 always @(posedge clk_sys) begin
 	reg old_pal;
@@ -500,7 +501,7 @@ end
 reg        PAL;
 reg  [7:0] rom_type;
 reg [23:0] rom_mask, ram_mask;
-reg  [3:0] ram_size;
+reg  [3:0] ram_size;	
 always @(posedge clk_sys) begin
 	reg [3:0] rom_size;
 	reg       rom_region = 0;
@@ -590,7 +591,7 @@ wire ss_avail;
 wire ss_ddr_ack, ss_ddr_req, ss_ddr_we;
 wire [63:0] ss_ddr_dout, ss_ddr_din;
 wire [21:3] ss_ddr_addr;
-wire [ 7:0] ss_ddr_be;
+wire [ 7:0] ss_ddr_be;	
 
 reg [15:0] main_audio_l;
 reg [15:0] main_audio_r;
@@ -1194,11 +1195,10 @@ end
 reg bk_ena = 0;
 reg old_downloading = 0;
 reg cart_ready = 0;
-reg ssbin_ready = 0;
+reg ssbin_ready = 0;	
 always @(posedge clk_sys) begin
 	old_downloading <= cart_download;
 	if(~old_downloading & cart_download) bk_ena <= 0;
-
 	if(old_downloading & ~cart_download) cart_ready <= 1;
 
 	if (ssbin_download) ssbin_ready <= 1;
@@ -1370,25 +1370,23 @@ wire        msu_data_ack;
 wire        msu_data_seek;
 wire        msu_data_req;
 wire [31:0] msu_data_base;
-
 wire [31:3] msu_ram_addr;
 wire        msu_ram_req;
 wire        msu_ram_ack;
-wire [63:0] msu_ram_dout;
+wire [63:0] msu_ram_dout;	
 
 assign DDRAM_CLK = clk_mem;
 
 msu_data_store msu_data_store
 (
+	.*,
 	.clk_sys(clk_sys),
 
 	.base_addr(msu_data_base),
-
 	.rd_next(msu_data_req),
 	.rd_seek(msu_data_seek),
 	.rd_seek_done(msu_data_ack),
 	.rd_addr(msu_data_addr),
-
 	.ram_addr(msu_ram_addr),
 	.ram_req(msu_ram_req),
 	.ram_ack(msu_ram_ack),
