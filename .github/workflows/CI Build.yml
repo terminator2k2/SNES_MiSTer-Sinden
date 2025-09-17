@@ -12,7 +12,7 @@ jobs:
     - uses: actions/checkout@v2
 
     - name: Build
-      run: set -o pipefail && curl --fail --location https://raw.githubusercontent.com/MiSTer-unstable-nightlies/Build-Automation_MiSTer/main/build.sh | bash -
+      run: set -o pipefail && curl --fail --location https://raw.githubusercontent.com/terminator2k2/Build-Automation_MiSTer/refs/heads/main/build.sh | bash -
       env:
         REPOSITORY: ${{ github.repository }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
