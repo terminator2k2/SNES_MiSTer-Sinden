@@ -14,7 +14,7 @@ jobs:
     - name: Build
       run: set -o pipefail && curl --fail --location https://raw.githubusercontent.com/terminator2k2/Build-Automation_MiSTer/refs/heads/main/build.sh | bash -
       env:
-        RELEASE_TAG: Sinden LightGun Core
+        RELEASE_TAG: Sinden-LightGun-Cores
         REPOSITORY: ${{ github.repository }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         DISPATCH_TOKEN: ${{ secrets.BUILD_AUTOMATION_DISPATCH_TOKEN }}
