@@ -290,10 +290,10 @@ wire reset = RESET | buttons[1] | status[0] | cart_download | spc_download | bk_
 ////////////////////////////  HPS I/O  //////////////////////////////////
 
 // Status Bit Map:
-// 0         1         2         3          4         5         6
-// 01234567890123456789012345678901 23456789012345678901234567890123
-// 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXXX XXXXXXXX
+// 0         1         2         3          4         5         6          7         8         9
+// 01234567890123456789012345678901 23456789012345678901234567890123 456789012345678901234567890
+// 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQ
+// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX X XXXXXXXXXXXXXXXXX XXXX                XXXXXXXXX
 
 `include "build_id.v"
 parameter CONF_STR = {
@@ -326,6 +326,9 @@ parameter CONF_STR = {
 	"d5P1o36,Crop Offset,0,2,4,8,10,12,-12,-10,-8,-6,-4,-2;",
 	"P1o89,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 	"P1oA,Force 256px,Off,On;",
+	"P1o[69],Sinden Border,Off,On;",
+	"P1o[73:70],Sinden Border Width,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20;",
+	"P1o[77:74],Sinden Border Height,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20;",
 	"P1-;",
 	"P1OG,Pseudo Transparency,Blend,Off;",
 	"P1-;",
@@ -379,7 +382,7 @@ parameter CONF_STR = {
 };
 
 wire  [1:0] buttons;
-wire [63:0] status;
+wire[127:0] status;
 wire [15:0] status_menumask = {ss_allow ,en216p, !GUN_MODE, ~turbo_allow, ~gg_available, ~GSU_ACTIVE, ~bk_ena};
 wire        forced_scandoubler;
 reg  [31:0] sd_lba;
@@ -1036,15 +1039,22 @@ wire [2:0] scale = status[11:9];
 wire [2:0] sl = scale ? scale - 1'd1 : 3'd0;
 wire       scandoubler = ~interlace && (scale || forced_scandoubler);
 
-video_mixer #(.LINE_LENGTH(520), .GAMMA(1)) video_mixer
+video_mixer #(.LINE_LENGTH(520), .GAMMA(1)) video_mixer_inst
 (
 	.*,
-	.hq2x(scale==1),
-	.freeze_sync(),
-	.VGA_DE(vga_de),
-	.R((LG_TARGET && GUN_MODE && (!status[29] | LG_T)) ? {8{LG_TARGET[0]}} : R),
-	.G((LG_TARGET && GUN_MODE && (!status[29] | LG_T)) ? {8{LG_TARGET[1]}} : G),
-	.B((LG_TARGET && GUN_MODE && (!status[29] | LG_T)) ? {8{LG_TARGET[2]}} : B)
+    .hq2x(scale==1),
+    .freeze_sync(),
+    .VGA_DE(vga_de),
+
+    // Border (white) now has highest priority, crosshair (red) next
+    .R((LG_BORDER) ? 8'hFF :
+       ((LG_TARGET && GUN_MODE && (!status[29] | LG_T)) ? {8{LG_TARGET[0]}} : R)),
+
+    .G((LG_BORDER) ? 8'hFF :
+       ((LG_TARGET && GUN_MODE && (!status[29] | LG_T)) ? {8{LG_TARGET[1]}} : G)),
+
+    .B((LG_BORDER) ? 8'hFF :
+       ((LG_TARGET && GUN_MODE && (!status[29] | LG_T)) ? {8{LG_TARGET[2]}} : B))
 );
 
 ////////////////////////////  I/O PORTS  ////////////////////////////////
@@ -1113,6 +1123,7 @@ wire       LG_P6_out;
 wire [1:0] LG_DO;
 wire [2:0] LG_TARGET;
 wire       LG_T = ((GUN_MODE[0]&joy0[6]) | (GUN_MODE[1]&joy1[6])); // always from joysticks
+wire LG_BORDER;	
 
 lightgun lightgun
 (
@@ -1141,7 +1152,11 @@ lightgun lightgun
 	.PORT_LATCH(JOY_STRB),
 	.PORT_CLK(JOY2_CLK),
 	.PORT_P6(LG_P6_out),
-	.PORT_DO(LG_DO)
+	.PORT_DO(LG_DO),
+	.border_en_gun(status[69]),
+	.border_h(status[73:70]),
+	.border_v(status[77:74]),
+	.border(LG_BORDER)
 );
 
 // 1 [oooo|ooo) 7 - 1:+5V  2:Clk  3:Strobe   4:D0  5:D1  6: I/O  7:Gnd
