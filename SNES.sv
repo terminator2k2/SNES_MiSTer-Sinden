@@ -577,6 +577,8 @@ main main
 	.MSU_AUDIO_PLAYING(msu_audio_playing),
 	.MSU_AUDIO_SECTOR(msu_audio_sector),
 	.MSU_RESUME_SECTOR(msu_resume_sector),
+	.MSU_AUDIO_LOOP_INDEX(msu_audio_loop_index),
+	.MSU_RESUME_LOOP_INDEX(msu_resume_loop_index),
 	.MSU_DATA_ADDR(msu_data_addr),
 	.MSU_DATA(msu_data),
 	.MSU_DATA_ACK(msu_data_ack),
@@ -1296,6 +1298,8 @@ wire        msu_audio_req;
 wire        msu_audio_seek;
 wire [21:0] msu_audio_sector;
 wire [21:0] msu_resume_sector;
+wire [31:0] msu_audio_loop_index;
+wire [31:0] msu_resume_loop_index;
 
 wire [15:0] msu_l;
 wire [15:0] msu_r;
@@ -1314,7 +1318,7 @@ msu_audio msu_audio
 	.ctl_repeat(msu_audio_repeat),
 
 	.track_size(msu_audio_size),
-	.track_processing(msu_track_missing | msu_track_mounting | msu_track_request),
+	.track_processing(msu_track_request),
 
 	.audio_download(msu_audio_download),
 	.audio_data(ioctl_dout),
@@ -1325,6 +1329,8 @@ msu_audio msu_audio
 	.audio_req(msu_audio_req),
 	.audio_seek(msu_audio_seek),
 	.resume_sector(msu_resume_sector),
+	.audio_loop_index(msu_audio_loop_index),
+	.resume_loop_index(msu_resume_loop_index),
 
 	.audio_l(msu_l),
 	.audio_r(msu_r)
