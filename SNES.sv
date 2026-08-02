@@ -29,7 +29,7 @@ assign AUDIO_S   = 1;
 assign AUDIO_MIX = status[20:19];
 
 assign LED_USER  = cart_download | ssbin_download | spc_download | (status[23] & bk_pending);
-assign LED_DISK  = 0;
+assign LED_DISK  = dbg_gsu_go_cnt[4];	//passive: blinks as long as the GSU keeps restarting each frame; freezes solid if it stalls
 assign LED_POWER = 0;
 assign BUTTONS   = osd_btn;
 assign VGA_SCALER= 0;
@@ -199,7 +199,7 @@ parameter CONF_STR = {
 	"D1P3OI,SuperFX Speed,Normal,Turbo;",
 	"D1P3oE,SuperFX FastROM,Yes,No;",
 	"D3P3O4,CPU Speed,Normal,Turbo;",
-	"P3OU,Audio Clock,Typical,Real;",
+	"P3OU,Audio clock,Typical,Real;",
 	"P3OV,Sufami Cart swapping,No,Yes;",
 	"P3oMP,Competition Cart time,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18;",
 	"P3-;",
@@ -439,6 +439,11 @@ end
 ////////////////////////////  SYSTEM  ///////////////////////////////////
 
 wire GSU_ACTIVE;
+wire [16:0] FX3_CPU_RAM_ADDR;
+wire  [7:0] FX3_CPU_RAM_D;
+wire  [7:0] FX3_CPU_RAM_Q;
+wire        FX3_CPU_RAM_CE_N;
+wire        FX3_CPU_RAM_WE_N;
 wire turbo_allow;
 wire SNES_SYSCLKR_CE,SNES_SYSCLKF_CE;
 wire SNES_REFRESH;
@@ -451,6 +456,7 @@ wire [ 7:0] ss_ddr_be;
 
 reg [15:0] main_audio_l;
 reg [15:0] main_audio_r;
+wire [15:0] dbg_gsu_go_cnt;
 
 main main
 (
@@ -489,6 +495,12 @@ main main
 	.BSRAM_CE_N(BSRAM_CE_N),
 	.BSRAM_OE_N(BSRAM_OE_N),
 	.BSRAM_WE_N(BSRAM_WE_N),
+
+	.FX3_CPU_RAM_ADDR(FX3_CPU_RAM_ADDR),
+	.FX3_CPU_RAM_D(FX3_CPU_RAM_D),
+	.FX3_CPU_RAM_Q(FX3_CPU_RAM_Q),
+	.FX3_CPU_RAM_CE_N(FX3_CPU_RAM_CE_N),
+	.FX3_CPU_RAM_WE_N(FX3_CPU_RAM_WE_N),
 
 	.WRAM_ADDR(WRAM_ADDR),
 	.WRAM_D(WRAM_D),
@@ -557,6 +569,8 @@ main main
 	
 	.DSP_FREQ(status[30]),
 	
+	.DBG_GSU_GO_CNT(dbg_gsu_go_cnt),
+	
 `ifdef DEBUG
 	.DBG_BG_EN(DBG_BG_EN),
 	.DBG_CPU_EN(DBG_CPU_EN),
@@ -577,8 +591,6 @@ main main
 	.MSU_AUDIO_PLAYING(msu_audio_playing),
 	.MSU_AUDIO_SECTOR(msu_audio_sector),
 	.MSU_RESUME_SECTOR(msu_resume_sector),
-	.MSU_AUDIO_LOOP_INDEX(msu_audio_loop_index),
-	.MSU_RESUME_LOOP_INDEX(msu_resume_loop_index),
 	.MSU_DATA_ADDR(msu_data_addr),
 	.MSU_DATA(msu_data),
 	.MSU_DATA_ACK(msu_data_ack),
@@ -844,26 +856,71 @@ wire [19:0] BSRAM_ADDR;
 wire        BSRAM_CE_N;
 wire        BSRAM_OE_N, BSRAM_WE_N;
 wire  [7:0] BSRAM_Q, BSRAM_D;
+wire        FX3_MODE = GSU_ACTIVE && rom_type[0];
 wire [19:0] BSRAM_SNI_ADDR;
 wire        BSRAM_SNI_RD, BSRAM_SNI_WR;
 wire [7:0]  BSRAM_SNI_D;
 wire        BSRAM_SNI_READY = (BSRAM_SNI_RD | BSRAM_SNI_WR) & (BSRAM_CE_N | (BSRAM_OE_N & BSRAM_WE_N));
 
-dpram_dif #(BSRAM_BITS,8,BSRAM_BITS-1,16) bsram 
+// Store the original 256 KiB byte-addressed BSRAM as two 128 KiB
+// byte lanes. Port A remains the GSU/SNI/clear byte port. Port B is
+// the normal 16-bit SD buffer interface, or the independent 8-bit FX3
+// SNES-CPU port while FX3 is active. This uses the same total RAM size
+// as the original mixed-width BSRAM and does not allocate an extra RAM.
+wire [BSRAM_BITS-1:0] bsram_a_addr = clearing_ram ? mem_fill_addr[BSRAM_BITS-1:0]
+                                      : BSRAM_SNI_READY ? BSRAM_SNI_ADDR[BSRAM_BITS-1:0]
+                                      : BSRAM_ADDR[BSRAM_BITS-1:0];
+wire [7:0] bsram_a_data = clearing_ram ? 8'hFF
+                         : BSRAM_SNI_READY ? BSRAM_SNI_D
+                         : BSRAM_D;
+wire       bsram_a_wren = clearing_ram ? mem_fill_we
+                         : BSRAM_SNI_READY ? BSRAM_SNI_WR
+                         : (~BSRAM_CE_N & ~BSRAM_WE_N);
+wire [7:0] bsram_even_q_a;
+wire [7:0] bsram_odd_q_a;
+
+wire [16:0] bsram_b_addr = FX3_MODE ? {1'b0, FX3_CPU_RAM_ADDR[16:1]}
+                                      : {sd_lba[BSRAM_BITS-10:0],sd_buff_addr};
+wire [7:0] bsram_even_b_data = FX3_MODE ? FX3_CPU_RAM_D : sd_buff_dout[7:0];
+wire [7:0] bsram_odd_b_data  = FX3_MODE ? FX3_CPU_RAM_D : sd_buff_dout[15:8];
+wire       bsram_even_b_wren = FX3_MODE
+                              ? (~FX3_CPU_RAM_CE_N & ~FX3_CPU_RAM_WE_N & ~FX3_CPU_RAM_ADDR[0])
+                              : (sd_buff_wr & sd_ack);
+wire       bsram_odd_b_wren  = FX3_MODE
+                              ? (~FX3_CPU_RAM_CE_N & ~FX3_CPU_RAM_WE_N &  FX3_CPU_RAM_ADDR[0])
+                              : (sd_buff_wr & sd_ack);
+wire [7:0] bsram_even_q_b;
+wire [7:0] bsram_odd_q_b;
+
+dpram_dif #(BSRAM_BITS-1,8,BSRAM_BITS-1,8) bsram_even
 (
 	.clock(clk_sys),
-
-	//Thrash the BSRAM upon ROM loading
-	.address_a(clearing_ram ? mem_fill_addr[BSRAM_BITS-1:0] : BSRAM_SNI_READY ? BSRAM_SNI_ADDR : BSRAM_ADDR[BSRAM_BITS-1:0]),
-	.data_a(clearing_ram ? 8'hFF : BSRAM_SNI_READY ? BSRAM_SNI_D : BSRAM_D),
-	.wren_a(clearing_ram ? mem_fill_we : BSRAM_SNI_READY ? BSRAM_SNI_WR : ~BSRAM_CE_N & ~BSRAM_WE_N),
-	.q_a(BSRAM_Q),
-
-	.address_b({sd_lba[BSRAM_BITS-10:0],sd_buff_addr}),
-	.data_b(sd_buff_dout),
-	.wren_b(sd_buff_wr & sd_ack),
-	.q_b(sd_buff_din)
+	.address_a(bsram_a_addr[BSRAM_BITS-1:1]),
+	.data_a(bsram_a_data),
+	.wren_a(bsram_a_wren & ~bsram_a_addr[0]),
+	.q_a(bsram_even_q_a),
+	.address_b(bsram_b_addr),
+	.data_b(bsram_even_b_data),
+	.wren_b(bsram_even_b_wren),
+	.q_b(bsram_even_q_b)
 );
+
+dpram_dif #(BSRAM_BITS-1,8,BSRAM_BITS-1,8) bsram_odd
+(
+	.clock(clk_sys),
+	.address_a(bsram_a_addr[BSRAM_BITS-1:1]),
+	.data_a(bsram_a_data),
+	.wren_a(bsram_a_wren & bsram_a_addr[0]),
+	.q_a(bsram_odd_q_a),
+	.address_b(bsram_b_addr),
+	.data_b(bsram_odd_b_data),
+	.wren_b(bsram_odd_b_wren),
+	.q_b(bsram_odd_q_b)
+);
+
+assign BSRAM_Q = bsram_a_addr[0] ? bsram_odd_q_a : bsram_even_q_a;
+assign sd_buff_din = {bsram_odd_q_b, bsram_even_q_b};
+assign FX3_CPU_RAM_Q = FX3_CPU_RAM_ADDR[0] ? bsram_odd_q_b : bsram_even_q_b;
 
 ////////////////////////////  VIDEO  ////////////////////////////////////
 
@@ -1298,8 +1355,6 @@ wire        msu_audio_req;
 wire        msu_audio_seek;
 wire [21:0] msu_audio_sector;
 wire [21:0] msu_resume_sector;
-wire [31:0] msu_audio_loop_index;
-wire [31:0] msu_resume_loop_index;
 
 wire [15:0] msu_l;
 wire [15:0] msu_r;
@@ -1318,7 +1373,7 @@ msu_audio msu_audio
 	.ctl_repeat(msu_audio_repeat),
 
 	.track_size(msu_audio_size),
-	.track_processing(msu_track_request),
+	.track_processing(msu_track_missing | msu_track_mounting | msu_track_request),
 
 	.audio_download(msu_audio_download),
 	.audio_data(ioctl_dout),
@@ -1329,8 +1384,6 @@ msu_audio msu_audio
 	.audio_req(msu_audio_req),
 	.audio_seek(msu_audio_seek),
 	.resume_sector(msu_resume_sector),
-	.audio_loop_index(msu_audio_loop_index),
-	.resume_loop_index(msu_resume_loop_index),
 
 	.audio_l(msu_l),
 	.audio_r(msu_r)

@@ -23,10 +23,11 @@ entity GSU is
 		
 		TURBO			: in std_logic;
 		FASTROM		: in std_logic;
+		FX3			: in std_logic;
 
 		IRQ_N			: out std_logic;
 		
-		ROM_A   		: out std_logic_vector(20 downto 0);
+		ROM_A   		: out std_logic_vector(21 downto 0);	--widened by 1 bit (was 20 downto 0): preserves bank bit5 so FX3's extended $60-$6F/$E0-$FF window addresses unique ROM data instead of aliasing $40-$4F/$C0-$CF
 		ROM_DI		: in std_logic_vector(7 downto 0);
 		ROM_RD_N		: out std_logic;							--for MISTer sdram
 				
@@ -35,6 +36,13 @@ entity GSU is
 		RAM_DO		: out std_logic_vector(7 downto 0);
 		RAM_WE_N		: out std_logic;
 		RAM_CE_N		: out std_logic;
+
+		-- Independent FX3 SNES-CPU RAM port.
+		FX3_CPU_RAM_A		: out std_logic_vector(16 downto 0);
+		FX3_CPU_RAM_DI		: in std_logic_vector(7 downto 0);
+		FX3_CPU_RAM_DO		: out std_logic_vector(7 downto 0);
+		FX3_CPU_RAM_CE_N	: out std_logic;
+		FX3_CPU_RAM_WE_N	: out std_logic;
 
 		SS_BUSY			: in std_logic;
 		SS_WR			: in std_logic;
@@ -153,6 +161,20 @@ architecture rtl of GSU is
 	signal RAM_FETCH_END	: std_logic;
 	signal RAM_CACHE_END	: std_logic;
 	signal RAM_PCF_FULL 		: std_logic;
+
+	--FX3 only: MERGE-repurposed-as-clear-command state (confirmed against Randy Linden's ProcessCommandFx3/ProcessClearCommandFx3/ClearCharFx3)
+	signal FX3_CLR_START	: std_logic;
+	signal FX3_CLR_PEND		: std_logic;
+	signal FX3_CLR_WAIT		: std_logic;
+	signal FX3_CLR_END		: std_logic;		--one-cycle pulse, set in the rising-edge state machine, read by the falling-edge branch to clear FX3_CLR_WAIT (matches RAM_LOAD_END/RAM_PCF_END pattern -- keeps every signal single-edge)
+	signal FX3_CLR_VALID	: std_logic;						--'1' if R(0) held a recognized clear command when MERGE ran
+	signal FX3_CLR_JBASE	: unsigned(4 downto 0);			--0/9/18 for ClearA/B/C
+	signal FX3_CLR_CNT		: unsigned(13 downto 0);			--flat counter: 0..10367 (18 rows * 9 columns * 64 bytes)
+	signal FX3_CLR_ADDR		: std_logic_vector(16 downto 0);
+	signal FX3_CLR_DATA		: std_logic_vector(7 downto 0);
+	signal FX3_CLEAR_PORT	: std_logic;
+	signal INTERNAL_RAM_ACCESS : std_logic;
+
 	signal ROM_ACCESS_CNT 	: unsigned(2 downto 0);
 	signal RAM_ACCESS_CNT 	: unsigned(2 downto 0);
 	signal CODE_IN_ROM 		: std_logic;
@@ -226,15 +248,29 @@ architecture rtl of GSU is
 	
 	signal GO_CNT 				: unsigned(15 downto 0);
 
+	-- FX3 passive debug latches. These do not alter execution or memory timing.
+	signal DBG_ROM_VALID      : std_logic;
+	signal DBG_RAM_VALID      : std_logic;
+	signal DBG_CLR_VALID      : std_logic;
+	signal DBG_STOP_SEEN      : std_logic;
+	signal DBG_FIRST_ROM_A    : std_logic_vector(21 downto 0);
+	signal DBG_FIRST_RAM_A    : std_logic_vector(16 downto 0);
+	signal DBG_FIRST_CLR_A    : std_logic_vector(16 downto 0);
+	signal DBG_STOP_CNT       : unsigned(15 downto 0);
+
 	signal SS_BUSY_SR			: std_logic_vector(1 downto 0);
 	signal SS_MEM_BUSY			: std_logic;
 	signal SS_RAM_LOAD_WORD		: std_logic;
 	signal SS_RAM_STORE_WORD	: std_logic;
+	signal FX3_MODE_INT		: std_logic;
 
 begin
 
+	-- Accept either mapper port name. Only one is normally connected.
+	FX3_MODE_INT <= FX3;
+
 	--IO Ports
-	process(ADDR)
+	process(ADDR, FX3_MODE_INT)
 	begin
 		MMIO_CACHE_SEL <= '0';
 		MMIO_SEL <= '0';
@@ -243,24 +279,51 @@ begin
 		SRAM_SEL <= '0';
 		SNES_RAM_A <= ADDR(16 downto 0);
 		if ADDR(22) = '0' then
-			if ADDR(15 downto 12) = x"3" then
-				if ADDR(11 downto 8) = x"0" then
-					if ADDR(7 downto 5) = "000" then												--00-3F:3000-301F, 80-BF:3000-301F
-						MMIO_REG_SEL <= '1';
-					else
-						MMIO_SEL <= '1';																--00-3F:3030-30FF, 80-BF:3030-30FF
+			if FX3_MODE_INT = '1' then
+				--FX3: registers exist ONLY at $7000-$7FFF (banks 00-3F/80-BF). There is no $3000-$3FFF register
+				--access and no per-bank $6000-$6FFF RAM window for this cart -- confirmed against Randy Linden's
+				--own Gsu.cpp constructor, which registers "this" (the register handler) at 0x7000-0x7FFF only
+				--when isFx3, and skips the $6000-$7FFF per-bank RAM handler loop entirely for FX3.
+				--Confirmed via isolation testing: not the cause of the title->black-screen regression
+				--(the ROM-read bypass was).
+				if ADDR(15 downto 12) = x"7" then
+					if ADDR(9 downto 8) = "00" then
+						if ADDR(7 downto 5) = "000" then
+							MMIO_REG_SEL <= '1';
+						else
+							MMIO_SEL <= '1';
+						end if;
+					elsif ADDR(9 downto 8) = "01" or ADDR(9 downto 8) = "10" then
+						MMIO_CACHE_SEL <= '1';
 					end if;
-				elsif ADDR(11 downto 8) = x"1" or ADDR(11 downto 8) = x"2"  then		--00-3F:3100-32FF, 80-BF:3100-32FF
-					MMIO_CACHE_SEL <= '1';
+				elsif ADDR(15) = '1' then
+					ROM_SEL <= '1';
 				end if;
-			elsif ADDR(15 downto 13) = "011"  then												--00-3F:6000-7FFF, 80-BF:6000-7FFF
-				SRAM_SEL <= '1';
-				SNES_RAM_A <= "0000" & ADDR(12 downto 0);
-			elsif ADDR(15) = '1' then 	
-				ROM_SEL <= '1';
+			else
+				--stock SuperFX behavior, unchanged
+				if ADDR(15 downto 12) = x"3" then
+					if ADDR(11 downto 8) = x"0" then
+						if ADDR(7 downto 5) = "000" then												--00-3F:3000-301F, 80-BF:3000-301F
+							MMIO_REG_SEL <= '1';
+						else
+							MMIO_SEL <= '1';																--00-3F:3030-30FF, 80-BF:3030-30FF
+						end if;
+					elsif ADDR(11 downto 8) = x"1" or ADDR(11 downto 8) = x"2"  then		--00-3F:3100-32FF, 80-BF:3100-32FF
+						MMIO_CACHE_SEL <= '1';
+					end if;
+				elsif ADDR(15 downto 13) = "011"  then												--00-3F:6000-7FFF, 80-BF:6000-7FFF
+					SRAM_SEL <= '1';
+					SNES_RAM_A <= "0000" & ADDR(12 downto 0);
+				elsif ADDR(15) = '1' then 	
+					ROM_SEL <= '1';
+				end if;
 			end if;
 		else
 			if ADDR(21) = '0' then																	--40-5F:0000-FFFF, C0-DF:0000-FFFF
+				ROM_SEL <= '1';
+			elsif FX3_MODE_INT = '1' and ADDR(23) = '1' then								--E0-FF:0000-FFFF (FX3 extended window)
+				ROM_SEL <= '1';
+			elsif FX3_MODE_INT = '1' and ADDR(20) = '0' then								--60-6F:0000-FFFF (FX3 extended window)
 				ROM_SEL <= '1';
 			elsif ADDR(23 downto 17) = x"7" & "000" then										--70-71:0000-FFFF
 				SRAM_SEL <= '1';
@@ -283,7 +346,11 @@ begin
 			FLAG_IRQ <= '0';
 			MS0 <= '0';
 			IRQ_OFF <= '0';
-			SCBR <= (others => '0');
+			if FX3_MODE_INT = '1' then
+               SCBR <= x"40";
+            else
+               SCBR <= (others => '0');
+            end if;
 			CLS <= '0';
 			SCMR_MD <= (others => '0');
 			SCMR_HT <= (others => '0');
@@ -387,15 +454,86 @@ begin
 	
 	GSU_ROM_ACCESS <= GSU_MEM_ACCESS and RON and not SS_MEM_BUSY;
 	GSU_RAM_ACCESS <= GSU_MEM_ACCESS and RAN and not SS_MEM_BUSY;
+
+	-- FX3 clear commands are unconditional memory operations and must not be
+	-- suppressed merely because SCMR.RAN is clear.
+	FX3_CLEAR_PORT <= '1' when FX3_MODE_INT = '1' and GSU_MEM_ACCESS = '1' and
+	                             RAMST = RAMST_FX3CLR and SS_MEM_BUSY = '0' else '0';
+
+	-- Internal GSU ownership. FX3 CPU RAM uses its own physical RAM port.
+	INTERNAL_RAM_ACCESS <= GSU_RAM_ACCESS or FX3_CLEAR_PORT;
 	
 	
+	-- Tiny built-in trace recorder for FX3 bring-up. Values latch once after reset.
+	-- Read through temporary MMIO registers $3032/$3035/$3037-$303A/$303D.
+	process(CLK, RST_N)
+		variable mapped_rom : std_logic_vector(21 downto 0);
+		variable write_addr : std_logic_vector(16 downto 0);
+	begin
+		if RST_N = '0' then
+			DBG_ROM_VALID   <= '0';
+			DBG_RAM_VALID   <= '0';
+			DBG_CLR_VALID   <= '0';
+			DBG_STOP_SEEN   <= '0';
+			DBG_FIRST_ROM_A <= (others => '0');
+			DBG_FIRST_RAM_A <= (others => '0');
+			DBG_FIRST_CLR_A <= (others => '0');
+			DBG_STOP_CNT    <= (others => '0');
+		elsif rising_edge(CLK) then
+			if INT_ROM_A(22) = '1' then
+				mapped_rom := INT_ROM_A(21 downto 0);
+			else
+				mapped_rom := '0' & INT_ROM_A(21 downto 16) & INT_ROM_A(14 downto 0);
+			end if;
+
+			if FX3_MODE_INT = '1' and FLAG_GO = '1' and GSU_ROM_ACCESS = '1' and DBG_ROM_VALID = '0' then
+				DBG_FIRST_ROM_A <= mapped_rom;
+				DBG_ROM_VALID <= '1';
+			end if;
+
+			if RAMST = RAMST_SAVE then
+				write_addr := RAMBR(0) & RAMADDR(15 downto 1) & (RAMADDR(0) xor RAM_BYTES);
+			elsif RAMST = RAMST_PCF then
+				write_addr := PCF_RAM_A;
+			else
+				write_addr := FX3_CLR_ADDR;
+			end if;
+
+			if FX3_MODE_INT = '1' and GSU_RAM_ACCESS = '1' and RAM_ACCESS_CNT = 0 and DBG_RAM_VALID = '0' and
+			   (RAMST = RAMST_SAVE or (RAMST = RAMST_PCF and PCF_RW = '1') or RAMST = RAMST_FX3CLR) then
+				DBG_FIRST_RAM_A <= write_addr;
+				DBG_RAM_VALID <= '1';
+			end if;
+
+			if FX3_MODE_INT = '1' and INTERNAL_RAM_ACCESS = '1' and RAMST = RAMST_FX3CLR and RAM_ACCESS_CNT = 0 and DBG_CLR_VALID = '0' then
+				DBG_FIRST_CLR_A <= FX3_CLR_ADDR;
+				DBG_CLR_VALID <= '1';
+			end if;
+
+			if FX3_MODE_INT = '1' and EN = '1' and OP.OP = OP_STOP then
+				DBG_STOP_SEEN <= '1';
+				DBG_STOP_CNT <= DBG_STOP_CNT + 1;
+			end if;
+		end if;
+	end process;
+
 	SFR <= FLAG_IRQ & "0" & "0" & FLAG_B & "0" & "0" & FLAG_ALT2 & FLAG_ALT1 & "0" & FLAG_R & FLAG_GO & FLAG_OV & FLAG_S & FLAG_CY & FLAG_Z & "0";
 	
 	process( MMIO_SEL, MMIO_REG_SEL, MMIO_CACHE_SEL, ROM_SEL, SRAM_SEL, ADDR, 
-				R, SFR, BRAMR, PBR, ROMBR, RAMBR, CBR, BRAM_CACHE_Q_B, GSU_ROM_ACCESS, ROM_DI, RAM_DI )
+				R, SFR, BRAMR, PBR, ROMBR, RAMBR, CBR, BRAM_CACHE_Q_B, GSU_ROM_ACCESS, ROM_DI, RAM_DI, FLAG_GO, FX3_MODE_INT, DBG_FIRST_ROM_A, DBG_FIRST_RAM_A, DBG_FIRST_CLR_A, DBG_ROM_VALID, DBG_RAM_VALID, DBG_CLR_VALID, DBG_STOP_SEEN, DBG_STOP_CNT, GO_CNT )
+		variable REG_READ_BLOCKED : boolean;
 	begin
 		DO <= x"00";
+		--Real SuperFX hardware: while running, only SFR ($30/$31) and VCR ($3B) are readable; everything else reads 0.
+		--FX3 additionally allows R15 to be read while running (it has no IRQ; the CPU polls R15 to detect completion).
+		--Confirmed against Randy Linden's Gsu.cpp Read(). Confirmed via isolation testing: not the cause of the
+		--title->black-screen regression (the ROM-read bypass was).
+		REG_READ_BLOCKED := (FLAG_GO = '1')
+			and not (MMIO_SEL = '1' and (ADDR(7 downto 0) = x"30" or ADDR(7 downto 0) = x"31" or ADDR(7 downto 0) = x"3B"))
+			and not (FX3_MODE_INT = '1' and MMIO_REG_SEL = '1' and ADDR(4 downto 1) = "1111");
+
 		if ROM_SEL = '1' then
+			--TEMPORARILY DISABLED (removed "FX3_MODE_INT = '1' or") while isolating a title->black-screen regression.
 			if GSU_ROM_ACCESS = '0' then
 				DO <= ROM_DI;
 			else	
@@ -412,37 +550,69 @@ begin
 				end if;
 			end if;
 		elsif MMIO_REG_SEL = '1' then
-			if ADDR(0) = '0' then
+			if REG_READ_BLOCKED then
+				DO <= x"00";
+			elsif ADDR(0) = '0' then
 				DO <= R(to_integer(unsigned(ADDR(4 downto 1))))(7 downto 0);
 			else
 				DO <= R(to_integer(unsigned(ADDR(4 downto 1))))(15 downto 8);
 			end if;
 		elsif MMIO_SEL = '1' then
+			if REG_READ_BLOCKED then
+				DO <= x"00";
+			else
 			case ADDR(7 downto 0) is
 				when x"30" =>						-- 3030 SFR
 					DO <= SFR(7 downto 0);
 				when x"31" =>						-- 3031 SFR
 					DO <= SFR(15 downto 8);
+				when x"32" =>						-- DEBUG status: bit0 ROM, bit1 RAM, bit2 clear, bit3 STOP
+					DO <= "0000" & DBG_STOP_SEEN & DBG_CLR_VALID & DBG_RAM_VALID & DBG_ROM_VALID;
 				when x"33" =>						-- 3033 BRAMR
 					DO <= BRAMR;
 				when x"34" =>						-- 3034 PBR
 					DO <= PBR;
+				when x"35" =>						-- DEBUG first ROM address bits 21:16
+					DO <= "00" & DBG_FIRST_ROM_A(21 downto 16);
 				when x"36" =>						-- 3036 ROMBR
 					DO <= ROMBR;
+				when x"37" =>						-- DEBUG first ROM address bits 15:8
+					DO <= DBG_FIRST_ROM_A(15 downto 8);
+				when x"38" =>						-- DEBUG first ROM address bits 7:0
+					DO <= DBG_FIRST_ROM_A(7 downto 0);
+				when x"39" =>						-- DEBUG first RAM write address bits 16:9
+					DO <= DBG_FIRST_RAM_A(16 downto 9);
+				when x"3A" =>						-- DEBUG first RAM write address bits 8:1
+					DO <= DBG_FIRST_RAM_A(8 downto 1);
 				when x"3B" =>						-- 303B VCR
-					DO <= x"04";
+					if FX3_MODE_INT = '1' then
+						DO <= x"52";		--FX3 version register, confirmed against Randy Linden's commit; re-enabled for bisection
+					else
+						DO <= x"04";
+					end if;
 				when x"3C" =>						-- 303C RAMBR
 					DO <= RAMBR;
+				when x"3D" =>						-- DEBUG: first RAM A0, first clear A16, STOP count low bits
+					DO <= std_logic_vector(DBG_STOP_CNT(5 downto 0)) & DBG_FIRST_CLR_A(16) & DBG_FIRST_RAM_A(0);
 				when x"3E" =>						-- 303E CBR
 					DO <= CBR(7 downto 0);
 				when x"3F" =>						-- 303F CBR
 					DO <= CBR(15 downto 8);
 				when others => null;
 			end case;
+			end if;
 		elsif MMIO_CACHE_SEL = '1' then
-			DO <= BRAM_CACHE_Q_B;
+			if REG_READ_BLOCKED then
+				DO <= x"00";
+			else
+				DO <= BRAM_CACHE_Q_B;
+			end if;
 		elsif SRAM_SEL = '1' then
-			DO <= RAM_DI;
+			if FX3_MODE_INT = '1' then
+				DO <= FX3_CPU_RAM_DI;
+			else
+				DO <= RAM_DI;
+			end if;
 		end if;
 	end process;
 
@@ -450,7 +620,7 @@ begin
 	
 	
 	--CPU Core
-	CODE_IN_ROM <= '1' when PBR <= x"5F" or (PBR >= x"80" and FASTROM = '1') else '0';
+	CODE_IN_ROM <= '1' when (PBR <= x"5F" or (FX3_MODE_INT = '1' and PBR <= x"6F")) or (PBR >= x"80" and FASTROM = '1') else '0';
 	CODE_IN_RAM <= '1' when PBR(7 downto 1) = "0111000" else '0';
 	IN_CACHE <= '1' when CACHE_POS(15 downto 9) = "0000000" else '0';
 	VAL_CACHE <= CACHE_VALID(to_integer(CACHE_POS(8 downto 4)));
@@ -489,6 +659,7 @@ begin
 	CPU_EN <= EN and
 	          not ROM_LOAD_WAIT and not ROM_FETCH_WAIT and not ROM_CACHE_WAIT and 
 	          not RAM_LOAD_WAIT and not RAM_SAVE_WAIT and not RAM_FETCH_WAIT and not RAM_CACHE_WAIT and not RAM_PCF_WAIT and 
+				 not FX3_CLR_WAIT and
 				 not MULT_WAIT;
 	
 	process(CLK, RST_N)
@@ -827,7 +998,7 @@ begin
 			FLAG_CY <= '0';
 			FLAG_OV <= '0';
 		elsif rising_edge(CLK) then
-			if CPU_EN = '1' and MC.FSET = '1' then
+			if CPU_EN = '1' and MC.FSET = '1' and not (OP.OP = OP_MERGE and FX3_MODE_INT = '1') then
 				FLAG_Z <= ALUZ;
 				FLAG_S <= ALUS;
 				FLAG_CY <= ALUCY;
@@ -898,6 +1069,8 @@ begin
 					R(15) <= R(to_integer(OP_N));
 				elsif OP.OP = OP_LJMP then
 					R(15) <= R(to_integer(SREG));
+				elsif OP.OP = OP_STOP and FX3_MODE_INT = '1' then
+					R(15) <= x"0000";		--FX3 only: confirmed against Randy Linden's Gsu.Instructions.cpp STOP() -- "The FX3 resets R15 to 0 when done - this allows the CPU to poll R15 to know when it's done running"
 				elsif OP.OP = OP_LOOP then
 					R(12) <= ALUR;
 					if ALUZ = '0' then
@@ -912,7 +1085,7 @@ begin
 				elsif OP.OP = OP_ROMB then
 					ROMBR <= R(to_integer(SREG))(7 downto 0) and x"7F";
 				elsif MC.DREG(1 downto 0) /= "00" then 
-					if MC.FSET = '1' then
+					if MC.FSET = '1' and not (OP.OP = OP_MERGE and FX3_MODE_INT = '1') then
 						R(to_integer(DST_REG)) <= ALUR;
 					else
 						case OP.OP is
@@ -1266,7 +1439,7 @@ begin
 					 PBR & R(15);
 
 				
-	ROM_A <= INT_ROM_A(20 downto 0) when INT_ROM_A(22) = '1' else INT_ROM_A(21 downto 16) & INT_ROM_A(14 downto 0);
+	ROM_A <= INT_ROM_A(21 downto 0) when INT_ROM_A(22) = '1' else '0' & INT_ROM_A(21 downto 16) & INT_ROM_A(14 downto 0);
 	
 	--RAM
 	--Pixel cashe
@@ -1329,6 +1502,14 @@ begin
 			RAMST <= RAMST_IDLE;
 			PCF_RW <= '0';
 
+			FX3_CLR_PEND <= '0';
+			FX3_CLR_WAIT <= '0';
+			FX3_CLR_END <= '0';
+			FX3_CLR_START <= '0';
+			FX3_CLR_VALID <= '0';
+			FX3_CLR_JBASE <= (others => '0');
+			FX3_CLR_CNT <= (others => '0');
+
 			POR_TRANS <= '0';
 			POR_DITH <= '0';
 			POR_HN <= '0';
@@ -1361,6 +1542,8 @@ begin
 					RAM_PCF_PEND <= '0';
 				elsif RAM_RPIX_START = '1' then
 					RAM_RPIX_PEND <= '0';
+				elsif FX3_CLR_START = '1' then
+					FX3_CLR_PEND <= '0';
 				end if;
 				
 				if CPU_EN = '1' then
@@ -1374,6 +1557,27 @@ begin
 						RAM_PCF_PEND <= '1';
 						RAM_PCF_WAIT <= '1';
 						RAM_RPIX_PEND <= '1';
+					elsif OP.OP = OP_MERGE and FX3_MODE_INT = '1' and MC.LAST_CYCLE = '1' then
+						--RE-ENABLED: RAN-gating bug fixed in RAMST_FX3CLR; testing at RAM_CYCLES=2 for FX3.
+						--FX3: MERGE is repurposed as a command dispatcher (confirmed against Randy Linden's
+						--ProcessCommandFx3). R(0) selects ClearA/B/C (values 3/4/5); anything else is a no-op.
+						--Commands 0/1/2 are acknowledged as no-ops here, matching the MesenCE software model;
+						--commands 3/4/5 execute the FX3 clear engine below.
+						FX3_CLR_PEND <= '1';
+						FX3_CLR_WAIT <= '1';
+						case R(0)(7 downto 0) is
+							when x"03" =>
+								FX3_CLR_VALID <= '1';
+								FX3_CLR_JBASE <= to_unsigned(0, 5);
+							when x"04" =>
+								FX3_CLR_VALID <= '1';
+								FX3_CLR_JBASE <= to_unsigned(9, 5);
+							when x"05" =>
+								FX3_CLR_VALID <= '1';
+								FX3_CLR_JBASE <= to_unsigned(18, 5);
+							when others =>
+								FX3_CLR_VALID <= '0';
+						end case;
 					end if;
 				end if;
 				
@@ -1399,6 +1603,9 @@ begin
 				end if;
 				if RAM_PCF_END = '1' then
 					RAM_PCF_WAIT <= '0';
+				end if;
+				if FX3_CLR_END = '1' then
+					FX3_CLR_WAIT <= '0';
 				end if;
 				
 				if CPU_EN = '1' then
@@ -1459,9 +1666,11 @@ begin
 				RAM_PCF_START <= '0';
 				RAM_RPIX_START <= '0';
 				RAM_FETCH_START <= '0';
+				FX3_CLR_START <= '0';
 				RAM_SAVE_END <= '0';
 				RAM_LOAD_END <= '0';
 				RAM_PCF_END <= '0';
+				FX3_CLR_END <= '0';
 				RAM_FETCH_END <= '0';
 				RAM_CACHE_END <= '0';
 			end if;
@@ -1513,12 +1722,19 @@ begin
 						else
 							NEW_COLOR := R(to_integer(SREG))(7 downto 0);
 						end if;
+						--Confirmed against Randy Linden's GetColor(): when POR_HN='1', the high nibble is
+						--ALWAYS preserved regardless of POR_FH (the ColorHighNibble check returns early in
+						--the reference, before FreezeHigh is even examined). The previous version checked
+						--POR_HN and POR_FH as two independent conditions, which incorrectly overwrote the
+						--high nibble whenever POR_HN='1' and POR_FH='0' simultaneously.
 						if POR_HN = '1' then
 							COLR(3 downto 0) <= NEW_COLOR(7 downto 4);
+							--COLR(7:4) intentionally left unchanged here: preserved.
+						elsif POR_FH = '1' then
+							COLR(3 downto 0) <= NEW_COLOR(3 downto 0);
+							--COLR(7:4) intentionally left unchanged here: preserved.
 						else
 							COLR(3 downto 0) <= NEW_COLOR(3 downto 0);
-						end if;
-						if POR_FH = '0' then
 							COLR(7 downto 4) <= NEW_COLOR(7 downto 4);
 						end if;
 					elsif OP.OP = OP_PLOT then
@@ -1547,9 +1763,11 @@ begin
 				RAM_PCF_START <= '0';
 				RAM_RPIX_START <= '0';
 				RAM_FETCH_START <= '0';
+				FX3_CLR_START <= '0';
 				RAM_SAVE_END <= '0';
 				RAM_LOAD_END <= '0';
 				RAM_PCF_END <= '0';
+				FX3_CLR_END <= '0';
 				RAM_FETCH_END <= '0';
 				RAM_CACHE_END <= '0';
 				case RAMST is
@@ -1593,6 +1811,11 @@ begin
 							RAM_ACCESS_CNT <= RAM_CYCLES - 1;
 							RAM_FETCH_START <= '1';
 							RAMST <= RAMST_FETCH;
+						elsif FX3_CLR_PEND = '1' then
+							RAM_ACCESS_CNT <= RAM_CYCLES;
+							FX3_CLR_START <= '1';
+							FX3_CLR_CNT <= (others => '0');
+							RAMST <= RAMST_FX3CLR;
 						end if;
 						
 					when RAMST_LOAD =>
@@ -1675,6 +1898,28 @@ begin
 							RAM_ACCESS_CNT <= RAM_CYCLES;
 						end if;
 						
+					when RAMST_FX3CLR =>
+						if FX3_CLR_VALID = '0' then
+							--R(0) held no recognized clear command: nothing to write, finish immediately
+							FX3_CLR_END <= '1';
+							RAMST <= RAMST_IDLE;
+						else
+							--No RAN gate here (unlike RAMST_SAVE/RAMST_PCF): confirmed against Randy Linden's
+							--ClearCharFx3, which is an unconditional memcpy with only a bounds check, no RAN/
+							--GsuRamAccess/SFR.Running dependency. Gating on RAN risked a deadlock if MERGE runs
+							--before the game has ever written SCMR (which is what sets RAN).
+							RAM_ACCESS_CNT <= RAM_ACCESS_CNT - 1;
+							if RAM_ACCESS_CNT = 0 then
+								RAM_ACCESS_CNT <= RAM_CYCLES;
+								if FX3_CLR_CNT = 10367 then
+									FX3_CLR_END <= '1';
+									RAMST <= RAMST_IDLE;
+								else
+									FX3_CLR_CNT <= FX3_CLR_CNT + 1;
+								end if;
+							end if;
+						end if;
+
 					when RAMST_FETCH =>
 						if RAN = '1' then
 							RAM_ACCESS_CNT <= RAM_ACCESS_CNT - 1;
@@ -1715,7 +1960,6 @@ begin
 					
 					when others => null;	
 				end case;
-			end if;
 
 			if SS_WR = '1' then
 				case ADDR(7 downto 0) is
@@ -1787,37 +2031,79 @@ begin
 				end case;
 			end if;
 		end if;
+		end if;
 	end process; 
 	
 	PCF_WR_DATA <= (PCF_RD_DATA and not PIX_CACHE(1).VALID) or (GetPCData(PIX_CACHE(1),BPP_CNT) and PIX_CACHE(1).VALID);
 	
+	--FX3 only: derive the write address/data for the current byte of the clear-command burst.
+	--addr = 0x10000 + i*64 + j*1280 + k, where i=0..17 (row), j=command-base+0..8 (column), k=0..63 (byte in chunk).
+	--Confirmed against Randy Linden's ClearCharFx3/ProcessClearCommandFx3 (offset = i*64 + j*20*64; 20*64=1280).
+	process(FX3_CLR_CNT, FX3_CLR_JBASE)
+		variable chunk_idx : unsigned(7 downto 0);
+		variable i_val      : unsigned(7 downto 0);
+		variable j_val      : unsigned(7 downto 0);
+		variable k_val      : unsigned(5 downto 0);
+		variable addr_val   : unsigned(16 downto 0);
+	begin
+		k_val := FX3_CLR_CNT(5 downto 0);
+		chunk_idx := resize(FX3_CLR_CNT(13 downto 6), 8);
+		i_val := chunk_idx / 9;
+		j_val := resize(FX3_CLR_JBASE, 8) + (chunk_idx mod 9);
+		addr_val := to_unsigned(65536, 17)
+					+ shift_left(resize(i_val, 17), 6)
+					+ resize(j_val * to_unsigned(1280, 11), 17)
+					+ resize(k_val, 17);
+		FX3_CLR_ADDR <= std_logic_vector(addr_val);
+
+		--64-byte alternating clear pattern: FF/00 (k<16), then all 00 (16<=k<48), then 00/FF (k>=48)
+		if k_val < 16 then
+			if k_val(0) = '0' then FX3_CLR_DATA <= x"FF"; else FX3_CLR_DATA <= x"00"; end if;
+		elsif k_val < 48 then
+			FX3_CLR_DATA <= x"00";
+		else
+			if k_val(0) = '0' then FX3_CLR_DATA <= x"00"; else FX3_CLR_DATA <= x"FF"; end if;
+		end if;
+	end process;
+
 	PCF_RAM_A <= GetCharOffset(PIX_CACHE(1).OFFSET, (SCMR_HT or POR_OBJ&POR_OBJ), SCMR_MD, BPP_CNT, SCBR);
 	
 	RPIX_RAM_A <= GetCharOffset(PC_Y & PC_X(7 downto 3), (SCMR_HT or POR_OBJ&POR_OBJ), SCMR_MD, BPP_CNT, SCBR); 
 	
-	RAM_A <= SNES_RAM_A when GSU_RAM_ACCESS = '0' else 
-				CACHE_SRC_ADDR(16 downto 0) when RAMST = RAMST_CACHE else 
+	-- Independent CPU side of FX3 RAM. Stock SuperFX remains on RAM_*.
+	FX3_CPU_RAM_A    <= SNES_RAM_A;
+	FX3_CPU_RAM_DO   <= DI;
+	FX3_CPU_RAM_CE_N <= '0' when FX3_MODE_INT = '1' and SRAM_SEL = '1' else '1';
+	FX3_CPU_RAM_WE_N <= WR_N;
+
+	-- In FX3 mode RAM_* is exclusively the GSU side of the dual-port RAM.
+	RAM_A <= SNES_RAM_A when INTERNAL_RAM_ACCESS = '0' and FX3_MODE_INT = '0' else
+				CACHE_SRC_ADDR(16 downto 0) when RAMST = RAMST_CACHE else
 				RAMBR(0) & RAMADDR(15 downto 1) & (RAMADDR(0) xor RAM_BYTES) when (RAMST = RAMST_LOAD or RAMST = RAMST_SAVE) else
 				PCF_RAM_A when RAMST = RAMST_PCF else
 				RPIX_RAM_A when RAMST = RAMST_RPIX else
+				FX3_CLR_ADDR when RAMST = RAMST_FX3CLR else
 				PBR(0) & R(15);
 				
-	RAM_DO <= DI when GSU_RAM_ACCESS = '0' else 
-				 RAMDR( 7 downto 0) when RAMST = RAMST_SAVE and RAM_BYTES = '0' and GSU_RAM_ACCESS = '1' else
-				 RAMDR(15 downto 8) when RAMST = RAMST_SAVE and RAM_BYTES = '1' and GSU_RAM_ACCESS = '1' else
-				 PCF_WR_DATA when RAMST = RAMST_PCF and GSU_RAM_ACCESS = '1' else
+	RAM_DO <= DI when INTERNAL_RAM_ACCESS = '0' and FX3_MODE_INT = '0' else
+				 RAMDR( 7 downto 0) when RAMST = RAMST_SAVE and RAM_BYTES = '0' else
+				 RAMDR(15 downto 8) when RAMST = RAMST_SAVE and RAM_BYTES = '1' else
+				 PCF_WR_DATA when RAMST = RAMST_PCF else
+				 FX3_CLR_DATA when RAMST = RAMST_FX3CLR else
 				 DI;
 	
-	RAM_WE_N <= '1' when ENABLE = '0' else 
-					WR_N when GSU_RAM_ACCESS = '0' else 
-					'0' when RAMST = RAMST_SAVE and RAM_ACCESS_CNT = 0 and GSU_RAM_ACCESS = '1' else
-					not PCF_RW when RAMST = RAMST_PCF and RAM_ACCESS_CNT = 0 and GSU_RAM_ACCESS = '1' else 
+	RAM_WE_N <= '1' when ENABLE = '0' else
+					WR_N when INTERNAL_RAM_ACCESS = '0' and FX3_MODE_INT = '0' else
+					'0' when RAMST = RAMST_SAVE and RAM_ACCESS_CNT = 0 else
+					not PCF_RW when RAMST = RAMST_PCF and RAM_ACCESS_CNT = 0 else
+					'0' when RAMST = RAMST_FX3CLR and RAM_ACCESS_CNT = 0 else
 					'1';
 
-	RAM_CE_N <= '0' when ENABLE = '0' else 
-					not SRAM_SEL when GSU_RAM_ACCESS = '0' else 
-					'0' when (RAMST = RAMST_LOAD or RAMST = RAMST_SAVE or RAMST = RAMST_PCF or RAMST = RAMST_RPIX or RAMST = RAMST_CACHE or RAMST = RAMST_FETCH) and GSU_RAM_ACCESS = '1' else 
+	RAM_CE_N <= '0' when ENABLE = '0' else
+					not SRAM_SEL when INTERNAL_RAM_ACCESS = '0' and FX3_MODE_INT = '0' else
+					'0' when (RAMST = RAMST_LOAD or RAMST = RAMST_SAVE or RAMST = RAMST_PCF or RAMST = RAMST_RPIX or RAMST = RAMST_CACHE or RAMST = RAMST_FETCH or RAMST = RAMST_FX3CLR) else
 					'1';
+
 					
 					
 	DBG_IN_CACHE <= IN_CACHE;

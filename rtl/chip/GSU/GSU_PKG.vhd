@@ -511,6 +511,7 @@ package GSU_PKG is
 	constant RAMST_PCF:			std_logic_vector(3 downto 0) := "1000";
 	constant RAMST_PCF_END:		std_logic_vector(3 downto 0) := "1001";
 	constant RAMST_RPIX:		std_logic_vector(3 downto 0) := "1010";
+	constant RAMST_FX3CLR:		std_logic_vector(3 downto 0) := "1011";	--FX3 only: bulk framebuffer-clear triggered by MERGE (repurposed on FX3 hardware)
 
 	--type MULTState_t is (
 	--	MULTST_IDLE, 
